@@ -1,0 +1,191 @@
+# PDAL native lib + python binding 을 한번에 묶은 manylinux_2_28 wheel 을 빌드해서
+# GitHub Releases 에 publish 한다. 본 repo 의 pyproject.toml `[tool.uv.sources] pdal`
+# 이 그 wheel URL 을 가리키므로 docker build / CI / 로컬 어디서도 PDAL source build 가
+# 발생하지 않는다. workflow_dispatch 로 PDAL 버전 갱신 시에만 수동 트리거.
+name: pdal-wheel-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdal_native_version:
+        description: "PDAL native (C++) version — https://github.com/PDAL/PDAL/releases"
+        type: string
+        default: "2.10.1"
+      pdal_python_version:
+        description: "PDAL/python tag — https://github.com/PDAL/python/releases"
+        type: string
+        default: "3.5.3"
+      python_minor:
+        description: "Python minor version (예: 3.14)"
+        type: string
+        default: "3.14"
+      proj_version:
+        description: "PROJ version — manylinux_2_28 의 6.3 은 PDAL 2.10 요구사항 (9.0+) 미달"
+        type: string
+        default: "9.8.1"
+      geos_version:
+        description: "GEOS version"
+        type: string
+        default: "3.14.1"
+      gdal_version:
+        description: "GDAL version — 3.13.0 은 너무 신생 (release 직후), 3.12.4 가 보수적"
+        type: string
+        default: "3.12.4"
+      libgeotiff_version:
+        description: "libgeotiff version — PDAL 2.10 의 REQUIRED dep (1.7.0+)"
+        type: string
+        default: "1.7.4"
+
+permissions:
+  contents: write  # GitHub Release 생성/asset upload
+
+jobs:
+  build:
+    name: build wheel
+    runs-on: ubuntu-latest
+    # push 트리거에서는 `inputs.*` 가 null. workflow_dispatch 와 push 양쪽 모두에서
+    # 동일하게 작동하도록 fallback (||) 으로 default 값을 일원화한다.
+    env:
+      PDAL_NATIVE_VERSION: ${{ inputs.pdal_native_version || '2.10.1' }}
+      PDAL_PYTHON_VERSION: ${{ inputs.pdal_python_version || '3.5.3' }}
+      PYTHON_MINOR: ${{ inputs.python_minor || '3.14' }}
+      PROJ_VERSION: ${{ inputs.proj_version || '9.8.1' }}
+      GEOS_VERSION: ${{ inputs.geos_version || '3.14.1' }}
+      GDAL_VERSION: ${{ inputs.gdal_version || '3.12.4' }}
+      LIBGEOTIFF_VERSION: ${{ inputs.libgeotiff_version || '1.7.4' }}
+    steps:
+      - name: Checkout PDAL/python source
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: PDAL/python
+          ref: ${{ env.PDAL_PYTHON_VERSION }}
+          path: pdal-python
+
+      - name: Compute Python ABI tag
+        id: pytag
+        # "3.14" → "cp314" (PEP 425 wheel tag)
+        run: |
+          minor_no_dot=$(echo "${{ env.PYTHON_MINOR }}" | tr -d '.')
+          echo "py_tag=cp${minor_no_dot}" >> "$GITHUB_OUTPUT"
+
+      # cibuildwheel 3.x 의 manylinux x86_64 디폴트는 이미 manylinux_2_28 이지만 명시 강제.
+      # manylinux_2_28 (AlmaLinux 8) 의 dnf 패키지가 RHEL 8 vintage (PROJ 6.3, GDAL 3.0) 라서
+      # PDAL 2.10 의 요구 (PROJ 9.0+) 미달. PROJ/GEOS/GDAL/PDAL 모두 source build 한다.
+      # 의존성 순서: PROJ → GEOS → GDAL → PDAL. 각 단계 install → ldconfig 후 다음 단계.
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v3.4.1
+        with:
+          package-dir: pdal-python
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: "${{ steps.pytag.outputs.py_tag }}-manylinux_x86_64"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: |
+            set -eux
+            # cmake/ninja 외에 native deps 빌드용 system libs (PDAL/python 의 deps 들이 추가로 link 할 수 있는 OS-level libs)
+            dnf install -y \
+                libcurl-devel libxml2-devel sqlite-devel libtiff-devel \
+                zlib-devel openssl-devel \
+                ninja-build
+
+            cd /tmp
+
+            echo "=== PROJ ${{ env.PROJ_VERSION }} ==="
+            curl -fsSL "https://download.osgeo.org/proj/proj-${{ env.PROJ_VERSION }}.tar.gz" | tar xz
+            cmake -S "proj-${{ env.PROJ_VERSION }}" -B build-proj -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DBUILD_TESTING=OFF -DENABLE_CURL=ON
+            cmake --build build-proj --target install --parallel
+            rm -rf build-proj "proj-${{ env.PROJ_VERSION }}"
+            ldconfig
+
+            echo "=== GEOS ${{ env.GEOS_VERSION }} ==="
+            curl -fsSL "https://github.com/libgeos/geos/releases/download/${{ env.GEOS_VERSION }}/geos-${{ env.GEOS_VERSION }}.tar.bz2" | tar xj
+            cmake -S "geos-${{ env.GEOS_VERSION }}" -B build-geos -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DBUILD_TESTING=OFF -DBUILD_DOCUMENTATION=OFF
+            cmake --build build-geos --target install --parallel
+            rm -rf build-geos "geos-${{ env.GEOS_VERSION }}"
+            ldconfig
+
+            echo "=== libgeotiff ${{ env.LIBGEOTIFF_VERSION }} ==="
+            # PDAL 2.10 의 REQUIRED dep — manylinux_2_28 dnf 의 libgeotiff 가 없거나 너무 옛것이라 source build.
+            # libtiff (dnf libtiff-devel) + PROJ (위에서 source build) 만 의존.
+            curl -fsSL "https://github.com/OSGeo/libgeotiff/releases/download/${{ env.LIBGEOTIFF_VERSION }}/libgeotiff-${{ env.LIBGEOTIFF_VERSION }}.tar.gz" | tar xz
+            cmake -S "libgeotiff-${{ env.LIBGEOTIFF_VERSION }}" -B build-geotiff -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_PREFIX_PATH=/usr/local
+            cmake --build build-geotiff --target install --parallel
+            rm -rf build-geotiff "libgeotiff-${{ env.LIBGEOTIFF_VERSION }}"
+            ldconfig
+
+            echo "=== GDAL ${{ env.GDAL_VERSION }} ==="
+            # PDAL 이 호출하는 GTIFGetOGISDefn / GTIFSetFromOGISDefn 는 libgeotiff 가 아니라
+            # GDAL 의 frmts/gtiff/gt_wkt_srs.cpp 에 정의되어 있고, 이는 GDAL 이 internal libgeotiff fork
+            # 를 빌드할 때만 export 된다 (PDAL issue #1575). 그래서 GDAL 은 internal TIFF/GeoTIFF 사용.
+            # 우리 source-build 한 libgeotiff 1.7.4 는 PDAL configure 의 find_package(GeoTIFF) 만족용.
+            curl -fsSL "https://github.com/OSGeo/gdal/releases/download/v${{ env.GDAL_VERSION }}/gdal-${{ env.GDAL_VERSION }}.tar.gz" | tar xz
+            cmake -S "gdal-${{ env.GDAL_VERSION }}" -B build-gdal -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_PREFIX_PATH=/usr/local \
+                -DBUILD_TESTING=OFF -DBUILD_DOCS=OFF -DBUILD_APPS=OFF \
+                -DBUILD_PYTHON_BINDINGS=OFF \
+                -DGDAL_USE_TIFF_INTERNAL=ON \
+                -DGDAL_USE_GEOTIFF_INTERNAL=ON
+            cmake --build build-gdal --target install --parallel
+            rm -rf build-gdal "gdal-${{ env.GDAL_VERSION }}"
+            ldconfig
+
+            echo "=== PDAL ${{ env.PDAL_NATIVE_VERSION }} ==="
+            curl -fsSL "https://github.com/PDAL/PDAL/releases/download/${{ env.PDAL_NATIVE_VERSION }}/PDAL-${{ env.PDAL_NATIVE_VERSION }}-src.tar.bz2" | tar xj
+            cmake -S "PDAL-${{ env.PDAL_NATIVE_VERSION }}-src" -B build-pdal -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_PREFIX_PATH=/usr/local \
+                -DBUILD_PLUGIN_PYTHON=OFF \
+                -DWITH_TESTS=OFF -DWITH_LASZIP=OFF
+            cmake --build build-pdal --target install --parallel
+            rm -rf build-pdal "PDAL-${{ env.PDAL_NATIVE_VERSION }}-src"
+            ldconfig
+          CIBW_ENVIRONMENT_LINUX: >-
+            CMAKE_PREFIX_PATH=/usr/local
+            PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+            LD_LIBRARY_PATH=/usr/local/lib
+          # auditwheel 이 manylinux_2_28 policy 에 따라 wheel 안에 libpdal/libgdal/libgeos/libproj/libcurl 등을 bundle
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel}"
+
+      - name: Inspect wheel
+        run: |
+          ls -la wheelhouse/
+          python -m pip install --user auditwheel
+          for whl in wheelhouse/*.whl; do
+            echo "=== auditwheel show $whl ==="
+            python -m auditwheel show "$whl"
+          done
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v3.0.0
+        with:
+          tag_name: pdal-${{ env.PDAL_PYTHON_VERSION }}-${{ steps.pytag.outputs.py_tag }}
+          name: "PDAL python ${{ env.PDAL_PYTHON_VERSION }} (${{ steps.pytag.outputs.py_tag }}, manylinux_2_28)"
+          body: |
+            Pre-built PDAL python wheel consumed by `pyproject.toml [tool.uv.sources] pdal`.
+
+            - **PDAL native**: ${{ env.PDAL_NATIVE_VERSION }}
+            - **PDAL python**: ${{ env.PDAL_PYTHON_VERSION }}
+            - **Python ABI**: ${{ steps.pytag.outputs.py_tag }}
+            - **Platform**: manylinux_2_28_x86_64
+            - **Bundled native deps** (via auditwheel): libpdal, libgdal, libgeos, libproj, libcurl, libxml2, libsqlite3, ...
+
+            Built from PDAL/python source — single-file wheel that requires no system PDAL.
+          files: wheelhouse/*.whl
+          fail_on_unmatched_files: true
