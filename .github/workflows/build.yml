@@ -1,11 +1,10 @@
-# PDAL native lib + python binding 을 한번에 묶은 manylinux_2_28 wheel 을 빌드해서
-# GitHub Releases 에 publish 한다. 본 repo 의 pyproject.toml `[tool.uv.sources] pdal`
-# 이 그 wheel URL 을 가리키므로 docker build / CI / 로컬 어디서도 PDAL source build 가
-# 발생하지 않는다. workflow_dispatch 로 PDAL 버전 갱신 시에만 수동 트리거.
+# PDAL native + python binding 을 묶은 manylinux_2_28 wheel 을 빌드해 GitHub Releases 에 publish.
+# `dronesquare-organization/dronesquare-backend` 의 pyproject.toml `[tool.uv.sources] pdal` 이
+# 그 wheel URL 을 가리켜 backend docker build / CI / 로컬 에서 PDAL source build 가 발생하지 않는다.
+# workflow_dispatch 로 PDAL 버전 갱신 시 수동 트리거 (PDAL/PROJ/GEOS/libgeotiff/GDAL/PDAL 버전 input).
 #
-# Matrix: x86_64 (ubuntu-latest) + aarch64 (ubuntu-24.04-arm). dronesquare-backend
-# 의 운영 환경은 Graviton (t4g.large, ARM64) — aarch64 wheel 이 prod 필수. x86_64 wheel
-# 은 로컬 개발 docker / amd64 환경 호환용.
+# Matrix: x86_64 (ubuntu-latest) + aarch64 (ubuntu-24.04-arm). backend prod 는 Graviton
+# (t4g.large, ARM64) — aarch64 wheel 이 필수. x86_64 wheel 은 amd64 docker 호환용.
 name: pdal-wheel-build
 
 on:
